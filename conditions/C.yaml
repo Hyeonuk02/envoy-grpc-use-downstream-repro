@@ -1,0 +1,83 @@
+# Condition C: use_downstream_protocol_config + external h2 route into the same cluster (origin-of-request test)
+admin:
+  address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }
+
+static_resources:
+  listeners:
+  # --- traffic listener: every request here produces a span -> tracer exports via otel_cluster ---
+  - name: ingress
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress
+          codec_type: AUTO
+          generate_request_id: true
+          tracing:
+            random_sampling: { value: 100 }
+            provider:
+              name: envoy.tracers.opentelemetry
+              typed_config:
+                "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                service_name: envoy-repro
+                grpc_service:
+                  envoy_grpc: { cluster_name: otel_cluster }
+                  timeout: 2s
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: local
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                direct_response: { status: 200, body: { inline_string: "ok\n" } }
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  # --- cond C only: external route into the SAME otel_cluster ---
+  # Hitting :10001 with `curl --http2-prior-knowledge` gives this path a REAL downstream protocol (HTTP/2),
+  # so use_downstream_protocol picks an HTTP/2 upstream pool. The tracer's internal path on the same
+  # cluster has stream_info hardcoded to Http11 and should pick an HTTP/1.1 pool. Two pools, one cluster.
+  - name: external_to_otel
+    address: { socket_address: { address: 0.0.0.0, port_value: 10001 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: external_to_otel
+          codec_type: AUTO
+          route_config:
+            name: to_otel
+            virtual_hosts:
+            - name: to_otel
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: otel_cluster, timeout: 2s }
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: otel_cluster
+    type: STRICT_DNS
+    connect_timeout: 2s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: otel_cluster
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address: { socket_address: { address: collector, port_value: 4317 } }
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        use_downstream_protocol_config:
+          http_protocol_options: {}
+          http2_protocol_options: {}
+

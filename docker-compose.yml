@@ -1,0 +1,43 @@
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:${OTELCOL_TAG:-0.161.0}
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol/config.yaml:ro
+    networks: [repro]
+
+  # tiny h2c upstream so condition C can route *external* HTTP/2 traffic through the same cluster.
+  # It is the Collector itself: an external h2 POST to /opentelemetry.proto.collector.trace.v1.TraceService/Export
+  # with a valid OTLP body would be ideal, but any h2 request that reaches the collector's gRPC port
+  # already creates an HTTP/2 upstream connection in the pool, which is what we need to observe.
+
+  envoy:
+    image: envoyproxy/envoy:${ENVOY_TAG:-v1.39-latest}
+    command:
+      - envoy
+      - -c
+      - /etc/envoy/envoy.yaml
+      - --component-log-level
+      - tracing:debug,grpc:debug,router:debug,pool:debug,http:debug,connection:debug,upstream:debug
+      - --log-format
+      - "[%Y-%m-%dT%T.%e] [%l] [%n] %v"
+    volumes:
+      - ./conditions/${COND:-A}.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "10000:10000"   # traffic listener (generates spans)
+      - "10001:10001"   # cond C only: external route into otel_cluster
+      - "9901:9901"     # admin
+    depends_on: [collector]
+    networks: [repro]
+
+  tcpdump:
+    image: nicolaka/netshoot:latest
+    network_mode: "service:envoy"
+    cap_add: [NET_ADMIN, NET_RAW]
+    command: ["sh", "-c", "tcpdump -i any -w /out/capture.pcap 'port 4317' "]
+    volumes:
+      - ./out/current/:/out
+    depends_on: [envoy]
+
+networks:
+  repro: {}
